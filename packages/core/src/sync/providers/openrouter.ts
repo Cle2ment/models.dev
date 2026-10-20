@@ -11,11 +11,13 @@ import type { ExistingModel, SyncProvider, SyncedFullModel, SyncedModel } from "
 // modality `decisions`) are returned only when requested explicitly.
 // https://openrouter.ai/docs/guides/community/jev
 const API_ENDPOINT = "https://openrouter.ai/api/v1/models?output_modalities=text,decisions";
-// Speech, transcription, embedding and rerank models are listed only when
-// requested by output modality. Image and video models aren't synced yet: their
-// prices live in the per-endpoint image API and the video SKU list.
+// Speech, transcription, embedding, rerank and video models are listed only when
+// requested by output modality. Video prices come from the video models list.
+// Image models aren't synced here: their prices live in the per-endpoint image API.
 // https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties
-const MEDIA_API_ENDPOINT = "https://openrouter.ai/api/v1/models?output_modalities=speech,transcription,embeddings,rerank";
+const MEDIA_API_ENDPOINT = "https://openrouter.ai/api/v1/models?output_modalities=speech,transcription,embeddings,rerank,video";
+// https://openrouter.ai/docs/guides/overview/multimodal/video-generation#via-the-video-models-api
+const VIDEO_MODELS_ENDPOINT = "https://openrouter.ai/api/v1/videos/models";
 const MODELS_DIR = path.join(import.meta.dirname, "..", "..", "..", "..", "..", "models");
 const modelMetadataByID = new Map<string, Record<string, unknown>>();
 const modelMetadataFilesByProvider = new Map<string, Set<string>>();
@@ -100,6 +102,10 @@ export function openrouterDirsForMetadataLab(metadata: string): string[] {
   return dirs.length > 0 ? dirs : [metadata];
 }
 
+export const OpenRouterVideoModels = z.object({
+  data: z.array(z.object({ id: z.string(), pricing_skus: z.record(z.string()).nullable().optional() }).passthrough()),
+});
+
 export const OpenRouterModel = z.object({
   id: z.string(),
   name: z.string(),
@@ -133,6 +139,8 @@ export const OpenRouterModel = z.object({
     max_completion_tokens: z.number().nullable(),
   }),
   supported_parameters: z.array(z.string()),
+  // Video SKU prices from the video models list, attached by fetchModels.
+  video_pricing_skus: z.record(z.string()).optional(),
   reasoning: z
     .object({
       mandatory: z.boolean(),
@@ -160,17 +168,26 @@ export const openrouter = {
     const headers = process.env.OPENROUTER_API_KEY
       ? { Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}` }
       : undefined;
-    const [text, media] = await Promise.all(
-      [API_ENDPOINT, MEDIA_API_ENDPOINT].map(async (url) => {
-        const response = await fetch(url, { headers });
-        if (!response.ok) {
-          throw new Error(`OpenRouter request failed: ${response.status} ${response.statusText}`);
-        }
-        return OpenRouterResponse.parse(await response.json());
-      }),
-    );
-    const ids = new Set(text!.data.map((model) => model.id));
-    return { data: [...text!.data, ...media!.data.filter((model) => !ids.has(model.id))] };
+    const get = async (url: string) => {
+      const response = await fetch(url, { headers });
+      if (!response.ok) {
+        throw new Error(`OpenRouter request failed: ${response.status} ${response.statusText}`);
+      }
+      return response.json();
+    };
+    const [text, media, videos] = await Promise.all([
+      get(API_ENDPOINT).then((raw) => OpenRouterResponse.parse(raw)),
+      get(MEDIA_API_ENDPOINT).then((raw) => OpenRouterResponse.parse(raw)),
+      get(VIDEO_MODELS_ENDPOINT).then((raw) => OpenRouterVideoModels.parse(raw)),
+    ]);
+    const ids = new Set(text.data.map((model) => model.id));
+    const skus = new Map(videos.data.map((model) => [model.id, model.pricing_skus ?? undefined]));
+    // Models that also output text come from the text list.
+    const extra = media.data.filter((model) => !ids.has(model.id) && mediaType(model) !== undefined);
+    for (const model of extra) {
+      if (mediaType(model) === "video") model.video_pricing_skus = skus.get(model.id);
+    }
+    return { data: [...text.data, ...extra] };
   },
   parseModels(raw) {
     // Temporarily skip batch routes (`*:batch`) — they are not catalog targets.
@@ -223,16 +240,17 @@ function isDecisionModel(model: OpenRouterModel) {
 }
 
 // ---------------------------------------------------------------------------
-// Speech, transcription, embedding and rerank models (v2-only files)
+// Speech, transcription, embedding, rerank and video models (v2-only files)
 // ---------------------------------------------------------------------------
 
-type MediaType = "speech" | "transcription" | "embedding" | "reranking";
+type MediaType = "speech" | "transcription" | "embedding" | "reranking" | "video";
 
 const MEDIA_TYPES: Record<string, MediaType> = {
   speech: "speech",
   transcription: "transcription",
   embeddings: "embedding",
   rerank: "reranking",
+  video: "video",
 };
 
 const BASE_URL = "https://openrouter.ai/api/v1";
@@ -245,11 +263,14 @@ const BASE_URL = "https://openrouter.ai/api/v1";
 // https://openrouter.ai/docs/api/api-reference/stt/create-transcription (POST /audio/transcriptions)
 // https://openrouter.ai/docs/api/api-reference/embeddings/submit-an-embedding-request (POST /embeddings)
 // https://openrouter.ai/docs/api/api-reference/rerank/submit-a-rerank-request (POST /rerank)
+// https://openrouter.ai/docs/guides/overview/multimodal/video-generation (POST /videos; the OpenRouter
+// AI SDK provider's videoModel)
 const MEDIA_APIS: Record<MediaType, { protocol: string; aisdk?: string }> = {
   speech: { protocol: "speech", aisdk: "@ai-sdk/openai" },
   transcription: { protocol: "transcriptions", aisdk: "@ai-sdk/openai" },
   embedding: { protocol: "embeddings", aisdk: "@openrouter/ai-sdk-provider" },
   reranking: { protocol: "rerank" },
+  video: { protocol: "videos", aisdk: "@openrouter/ai-sdk-provider" },
 };
 
 const MEDIA_HEADERS: Record<MediaType, string> = {
@@ -275,6 +296,14 @@ const MEDIA_HEADERS: Record<MediaType, string> = {
     "# and per-token prices), so only free routes get a price.",
     "# https://openrouter.ai/docs/api/api-reference/rerank/submit-a-rerank-request",
   ].join("\n"),
+  video: [
+    "# Synced from https://openrouter.ai/api/v1/models?output_modalities=video. Prices are the pricing_skus of",
+    "# https://openrouter.ai/api/v1/videos/models: per second of output (cents_per_* / 100, duration_seconds_* in USD)",
+    "# or per video token (video_tokens_*). SKU qualifiers are overrides on the plain or first SKU: resolution,",
+    "# generate_audio (true by default for models with audio), mode (text-to-video, image-to-video, reference-to-video)",
+    "# and input_video. No [cost] when a SKU has no CostV2 form (minimum charge per generation, per megapixel-second).",
+    "# https://openrouter.ai/docs/guides/overview/multimodal/video-generation",
+  ].join("\n"),
 };
 
 // MIME types per OpenRouter's docs.
@@ -297,6 +326,7 @@ const MEDIA_DESCRIPTIONS: Record<MediaType, string> = {
   transcription: "Speech-to-text model",
   embedding: "Text embedding model",
   reranking: "Reranking model",
+  video: "Video generation model",
 };
 
 // OpenRouter IDs whose lab file has another name. Matching otherwise compares
@@ -314,6 +344,23 @@ const MEDIA_BASE_MODEL_OVERRIDES: Record<string, string> = {
   // of life on 2026-10-02 and is served by 2.0 (https://docs.x.ai/developers/release-notes).
   "x-ai/grok-voice-tts-1.0": "xai/grok-tts",
   "x-ai/grok-stt-1.0": "xai/grok-voice-transcribe-2.0",
+  // Video models whose lab file uses the lab's API name.
+  "alibaba/wan-3.0": "alibaba/wan3.0-video",
+  "alibaba/wan-3.0-prime": "alibaba/wan3.0-video-prime",
+  "minimax/hailuo-3": "minimax/MiniMax-H3",
+  "minimax/hailuo-3-max": "minimax/MiniMax-H3-Max",
+  "minimax/hailuo-2.3": "minimax/MiniMax-Hailuo-2.3",
+  // Veo 3.1 on Vertex AI; the lab files carry the Gemini API model names.
+  "google/veo-3.1": "google/veo-3.1-generate-preview",
+  "google/veo-3.1-fast": "google/veo-3.1-fast-generate-preview",
+  "google/veo-3.1-lite": "google/veo-3.1-lite-generate-preview",
+};
+
+// OpenRouter prefixes of media labs that the chat prefix table doesn't cover. Kept separate so chat
+// models under these prefixes don't start resolving to new labs.
+const MEDIA_LAB_PREFIXES: Record<string, string> = {
+  bytedance: "bytedance-seed",
+  kwaivgi: "kuaishou",
 };
 
 // Transcription models whose pricing.prompt is per audio hour, not per second.
@@ -323,6 +370,121 @@ const MEDIA_BASE_MODEL_OVERRIDES: Record<string, string> = {
 // https://openrouter.ai/microsoft/mai-transcribe-2
 // https://techcommunity.microsoft.com/blog/azure-ai-foundry-blog/mai-transcribe-2-highest-quality-transcription-at-the-fastest-speed-and-lowest-c/4550972
 const HOURLY_TRANSCRIPTION = new Set(["microsoft/mai-transcribe-1.5", "microsoft/mai-transcribe-2"]);
+
+type VideoSku = { target: "output" | "image"; unit: "second" | "token" | "image"; price: number; when: Record<string, string | boolean> };
+
+const VIDEO_RESOLUTION = "(480p|720p|768p|1080p|2k|4k)";
+const VIDEO_MODES: Record<string, string> = {
+  text_to_video_: "text-to-video",
+  image_to_video_: "image-to-video",
+  reference_: "reference-to-video",
+};
+
+// OpenRouter's request values: 480p, 720p, 768p, 1080p, 2K, 4K.
+function videoResolution(value: string | undefined) {
+  return value === undefined ? undefined : value.endsWith("k") ? value.toUpperCase() : value;
+}
+
+function videoWhen(entries: Record<string, string | boolean | undefined>) {
+  return Object.fromEntries(Object.entries(entries).filter(([, value]) => value !== undefined)) as Record<string, string | boolean>;
+}
+
+// One video SKU as a price and its request conditions, or undefined when it has no CostV2 form
+// (minimum_cents_per_generation, cents_per_megapixel_second_*) or an unknown name.
+export function parseVideoSku(name: string, value: string): VideoSku | undefined {
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount < 0) return undefined;
+  const cents = roundPrice(amount / 100);
+  if (name === "cents_per_image_input") return { target: "image", unit: "image", price: cents, when: {} };
+  if (name === "reference_images" || name === "reference_input_images") {
+    return { target: "image", unit: "image", price: roundPrice(amount), when: {} };
+  }
+  let match = new RegExp(`^cents_per_(?:second_output|video_output_second)(?:_${VIDEO_RESOLUTION})?$`).exec(name);
+  if (match !== null) {
+    return { target: "output", unit: "second", price: cents, when: videoWhen({ resolution: videoResolution(match[1]) }) };
+  }
+  match = new RegExp(`^cents_per_second_video_continuation(?:_${VIDEO_RESOLUTION})?$`).exec(name);
+  if (match !== null) {
+    return {
+      target: "output",
+      unit: "second",
+      price: cents,
+      when: videoWhen({ resolution: videoResolution(match[1]), input_video: true }),
+    };
+  }
+  match = new RegExp(`^(text_to_video_|image_to_video_|reference_)?duration_seconds(?:_(with|without)_audio)?(?:_${VIDEO_RESOLUTION})?$`).exec(name);
+  if (match !== null) {
+    return {
+      target: "output",
+      unit: "second",
+      price: roundPrice(amount),
+      when: videoWhen({
+        resolution: videoResolution(match[3]),
+        generate_audio: match[2] === undefined ? undefined : match[2] === "with",
+        mode: match[1] === undefined ? undefined : VIDEO_MODES[match[1]],
+      }),
+    };
+  }
+  match = new RegExp(`^video_tokens(?:_${VIDEO_RESOLUTION})?(?:_(with_video_input|without_audio))?$`).exec(name);
+  if (match !== null) {
+    return {
+      target: "output",
+      unit: "token",
+      price: price(value)!,
+      when: videoWhen({
+        resolution: videoResolution(match[1]),
+        input_video: match[2] === "with_video_input" ? true : undefined,
+        generate_audio: match[2] === "without_audio" ? false : undefined,
+      }),
+    };
+  }
+  return undefined;
+}
+
+// Video prices from OpenRouter's pricing SKUs. The plain SKU (else the first) is the base price;
+// each other SKU becomes an override on its qualifiers, more specific ones last so they win, and
+// SKUs that already price out the same are left out. Any SKU without a CostV2 form drops the cost.
+export function videoCost(skus: Record<string, string> | undefined) {
+  if (skus === undefined || Object.keys(skus).length === 0) return undefined;
+  const parsed: VideoSku[] = [];
+  for (const [name, value] of Object.entries(skus)) {
+    const sku = parseVideoSku(name, value);
+    if (sku === undefined) return undefined;
+    parsed.push(sku);
+  }
+  const images = [...new Set(parsed.filter((sku) => sku.target === "image").map((sku) => sku.price))];
+  const outputs = parsed.filter((sku) => sku.target === "output");
+  if (images.length > 1 || outputs.length === 0 || new Set(outputs.map((sku) => sku.unit)).size > 1) return undefined;
+
+  const base = outputs.find((sku) => Object.keys(sku.when).length === 0) ?? outputs[0]!;
+  const matches = (when: Record<string, unknown>, target: Record<string, unknown>) =>
+    Object.entries(when).every(([key, value]) => target[key] === value);
+  const applied: VideoSku[] = [];
+  const rest = outputs
+    .filter((sku) => sku !== base)
+    .sort((a, b) => Object.keys(a.when).length - Object.keys(b.when).length);
+  for (const sku of rest) {
+    const effective = applied.reduce(
+      (current, override) => matches(override.when, sku.when) ? override.price : current,
+      base.price,
+    );
+    if (effective !== sku.price) applied.push(sku);
+  }
+  const overrides = applied.map((sku) => ({
+    when: Object.fromEntries(Object.entries(sku.when).map(([key, value]) => [key, { equals: value }])),
+    price: sku.price,
+  }));
+  return {
+    ...(images.length === 1 ? { image: { input: { unit: "image", price: images[0]! } } } : {}),
+    video: {
+      output: {
+        ...(base.unit === "second" ? { unit: "second" } : {}),
+        price: base.price,
+        ...(overrides.length > 0 ? { overrides } : {}),
+      },
+    },
+  };
+}
 
 export function mediaType(model: OpenRouterModel): MediaType | undefined {
   const [output, ...rest] = model.architecture.output_modalities;
@@ -409,7 +571,7 @@ export function buildOpenRouterMediaModel(
     };
     doc.limit = {
       context,
-      output: type === "embedding" || type === "reranking"
+      output: type === "embedding" || type === "reranking" || type === "video"
         ? 0
         : model.top_provider.max_completion_tokens ?? 0,
     };
@@ -471,11 +633,18 @@ function mediaModalities(model: OpenRouterModel, type: MediaType) {
         input: [...new Set(model.architecture.input_modalities.flatMap((value) => MIME_INPUT[value] ?? []))],
         output: [type],
       };
+    case "video":
+      // Jobs download as MP4 (https://openrouter.ai/docs/guides/overview/multimodal/video-generation).
+      return {
+        input: [...new Set(model.architecture.input_modalities.flatMap((value) => MIME_INPUT[value] ?? []))],
+        output: ["video/mp4"],
+      };
   }
 }
 
 // Prices per CostV2 unit: per 1M tokens or characters, per second otherwise.
 export function mediaCost(model: OpenRouterModel, type: MediaType) {
+  if (type === "video") return videoCost(model.video_pricing_skus);
   const free = model.id.endsWith(":free");
   const prompt = Number(model.pricing.prompt);
   const completion = Number(model.pricing.completion);
@@ -531,7 +700,7 @@ export function resolveMediaBaseModel(openrouterID: string) {
   const [prefix, ...modelParts] = openrouterID.split("/");
   if (prefix === undefined || modelParts.length === 0 || prefix.startsWith("~")) return undefined;
   const lab = CANONICAL_PROVIDER_PREFIXES[prefix.toLowerCase() as keyof typeof CANONICAL_PROVIDER_PREFIXES]
-    ?.metadata ?? prefix.toLowerCase();
+    ?.metadata ?? MEDIA_LAB_PREFIXES[prefix.toLowerCase()] ?? prefix.toLowerCase();
   const slug = normalizeModelSlug(modelParts.join("/").replace(/:free$/, ""));
   const matches = [...labFiles(lab)].filter(
     (file) => file.endsWith(".toml") && normalizeModelSlug(file.slice(0, -".toml".length)) === slug,
